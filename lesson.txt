@@ -1,0 +1,22 @@
+What is our server.c code actually doing?
+When we compiled the program, it started like this:
+
+1. socket() created a communication endpoint socket that will consist of an IPv4 address (we will use localhost = 127.0.0.1), communication protocol (TCP), and port (we will use 8080)
+2. bind() attaches this socket to the IP address 127.0.0.1 (loopback address) and the TCP port 8080
+3. listen() tells the kernel to start accepting incoming connections requests
+4. curl opened its own socket and connected to 127.0.0.1:8080
+Note: there is a hidden step of TCP handshake before HTTP starts, this happens within the kernel:
+* client socket sends a synchronize packet to kernel
+* kernel sends a syn-ack packet back (synchronize and acknowledge)
+* client sends an ack packet back (hear the reply, establish connection)
+
+5. accept() sees the client connection, creates a listening socket
+6. curl sends HTTP GET request - just plain text over TCP (Transmission Control Protocol)
+7. recv(): the kernel copied TCP data into process memory, then placed into a buffer where recv() read this raw text data
+8. we hardcoded an HTML page containing the header "Hello from C server" and an HTTP Response consisting of:
+* status line: HTTP/1.1 200 OK - protocol, status code, success
+* header metadata
+* body, for which our browser parsed the HTML and rendered header
+
+9. send() transmitted that HTTP response back to curl or our browser, the client
+10. Google Chrome web browser rendered the page after parsing HTTP response and HTML code
