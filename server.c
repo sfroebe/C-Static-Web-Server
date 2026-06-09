@@ -2,6 +2,7 @@
 #include <stdlib.h>     /* EXIT_SUCCESS, EXIT_FAILURE, malloc(), free() */
 #include <string.h>     /* strlen(), strcmp(), strchr(), strrchr(), strstr(), memset(), memcpy() */
 #include <unistd.h>     /* close() */
+#include <pthread.h>    /* pthread_create(), pthread_detach(), pthread_self() */
 #include <arpa/inet.h>  /* sockaddr_in, htons(), htonl() */
 #include <sys/types.h>  /* ssize_t */
 #include <sys/socket.h> /* socket(), bind(), listen(), accept(), recv(), send() */
@@ -18,6 +19,7 @@ typedef struct {
 } HttpRequest;
 
 int create_server_socket(void);
+void *client_thread(void *arg);
 void handle_client(int client_fd);
 int parse_http_request(const char *raw_request, HttpRequest *request);
 int validate_path(const char *path);
@@ -45,12 +47,27 @@ int main(void)
     printf("Serving files from the ./public directory.\n");
     printf("Press Ctrl+C to stop the server.\n\n");
 
-    /* Keep accepting clients forever, one client at a time. */
+    /* Keep accepting clients forever.
+
+       In the earlier single-threaded version, the server did this:
+
+           accept one client -> handle that client -> accept the next client
+
+       That is simple, but one slow client can make every other client wait.
+
+       In this threaded version, the main thread only accepts new connections.
+       Each client is handed to a worker thread, so several requests can be in
+       progress at the same time. This is called thread-per-connection
+       concurrency. It is easy to understand, but it is not infinitely scalable:
+       thousands of clients would mean thousands of operating-system threads. */
     while (1) {
         int client_fd;
+        int *client_fd_ptr;
         struct sockaddr_in client_addr;
         socklen_t client_addr_length;
         char client_ip[INET_ADDRSTRLEN];
+        pthread_t thread_id;
+        int pthread_result;
 
         /* accept() blocks here until a browser or curl opens a connection. */
         client_addr_length = sizeof(client_addr);
@@ -64,10 +81,46 @@ int main(void)
         snprintf(client_ip, sizeof(client_ip), "%s", inet_ntoa(client_addr.sin_addr));
         printf("[INFO] Client connected: %s\n", client_ip);
 
-        handle_client(client_fd);
+        /* Give the client socket to a worker thread.
 
-        /* This server closes each connection after one request and response. */
-        close(client_fd);
+           IMPORTANT: do not pass &client_fd directly to pthread_create().
+           client_fd is a stack variable that gets reused on the next loop
+           iteration. If the main thread accepts another client before the
+           worker thread copies the value, both threads could look at the same
+           changing variable. That race can make a worker handle the wrong
+           socket, or a socket that has already been replaced.
+
+           Allocating one int per connection gives each worker its own stable
+           copy. The worker frees this memory after copying out the fd value. */
+        client_fd_ptr = malloc(sizeof(*client_fd_ptr));
+        if (client_fd_ptr == NULL) {
+            perror("malloc failed");
+            close(client_fd);
+            continue;
+        }
+
+        *client_fd_ptr = client_fd;
+
+        /* pthread_create() starts client_thread() in a new thread.
+           The fourth argument is the one void* value passed to that function. */
+        pthread_result = pthread_create(&thread_id, NULL, client_thread, client_fd_ptr);
+        if (pthread_result != 0) {
+            printf("[ERROR] pthread_create failed: %s\n", strerror(pthread_result));
+            free(client_fd_ptr);
+            close(client_fd);
+            continue;
+        }
+
+        /* A detached thread cleans up its own thread resources when it exits.
+           That keeps this small server from needing to remember every thread
+           and call pthread_join() later. */
+        pthread_result = pthread_detach(thread_id);
+        if (pthread_result != 0) {
+            printf("[ERROR] pthread_detach failed: %s\n", strerror(pthread_result));
+        }
+
+        printf("[THREAD] Spawned worker thread %lu for %s\n",
+               (unsigned long)thread_id, client_ip);
     }
 
     /* This line is never reached in this simple server, but it shows proper cleanup. */
@@ -117,6 +170,29 @@ int create_server_socket(void)
     }
 
     return server_fd;
+}
+
+void *client_thread(void *arg)
+{
+    int client_fd;
+
+    /* The main accept loop allocated this int so the worker gets a stable
+       socket descriptor, not the address of a changing stack variable. */
+    client_fd = *(int *)arg;
+    free(arg);
+
+    printf("[THREAD %lu] Handling client connection\n", (unsigned long)pthread_self());
+
+    handle_client(client_fd);
+
+    /* This server closes each connection after one request and response.
+       Closing here matters because the worker thread owns the client socket
+       once pthread_create() succeeds. */
+    close(client_fd);
+
+    printf("[THREAD %lu] Client connection closed\n", (unsigned long)pthread_self());
+
+    return NULL;
 }
 
 void handle_client(int client_fd)
@@ -257,15 +333,18 @@ int validate_path(const char *path)
 void log_request(const HttpRequest *request)
 {
     /* Structured logs make it easier to follow one request through the server. */
-    printf("[REQUEST] %s %s %s\n", request->method, request->path, request->version);
+    printf("[REQUEST][thread %lu] %s %s %s\n",
+           (unsigned long)pthread_self(), request->method, request->path, request->version);
 }
 
 void log_response(const char *status, const char *file_path)
 {
     if (file_path != NULL) {
-        printf("[RESPONSE] %s %s\n\n", status, file_path);
+        printf("[RESPONSE][thread %lu] %s %s\n\n",
+               (unsigned long)pthread_self(), status, file_path);
     } else {
-        printf("[RESPONSE] %s\n\n", status);
+        printf("[RESPONSE][thread %lu] %s\n\n",
+               (unsigned long)pthread_self(), status);
     }
 }
 
