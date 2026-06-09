@@ -1,6 +1,6 @@
 #include <stdio.h>      /* printf(), perror(), fopen(), fread(), fclose() */
 #include <stdlib.h>     /* EXIT_SUCCESS, EXIT_FAILURE, malloc(), free() */
-#include <string.h>     /* strlen(), strcmp(), strstr(), strrchr(), memset() */
+#include <string.h>     /* strlen(), strcmp(), strchr(), strrchr(), strstr(), memset(), memcpy() */
 #include <unistd.h>     /* close() */
 #include <arpa/inet.h>  /* sockaddr_in, htons(), htonl() */
 #include <sys/types.h>  /* ssize_t */
@@ -9,15 +9,26 @@
 #define PORT 8080
 #define BACKLOG 10
 #define REQUEST_BUFFER_SIZE 4096
-#define METHOD_SIZE 16
-#define PATH_SIZE 256
-#define FILE_PATH_SIZE 512
+#define FILE_PATH_SIZE 1024
+
+typedef struct {
+    char method[8];
+    char path[512];
+    char version[16];
+} HttpRequest;
 
 int create_server_socket(void);
 void handle_client(int client_fd);
+int parse_http_request(const char *raw_request, HttpRequest *request);
+int validate_path(const char *path);
+void log_request(const HttpRequest *request);
+void log_response(const char *status, const char *file_path);
 void send_response(int client_fd, const char *status_line, const char *content_type,
                    long content_length, const unsigned char *body);
+void send_400(int client_fd);
+void send_403(int client_fd);
 void send_404(int client_fd);
+void send_405(int client_fd);
 const char *get_mime_type(const char *file_path);
 void serve_file(int client_fd, const char *file_path);
 
@@ -37,15 +48,21 @@ int main(void)
     /* Keep accepting clients forever, one client at a time. */
     while (1) {
         int client_fd;
+        struct sockaddr_in client_addr;
+        socklen_t client_addr_length;
+        char client_ip[INET_ADDRSTRLEN];
 
         /* accept() blocks here until a browser or curl opens a connection. */
-        client_fd = accept(server_fd, NULL, NULL);
+        client_addr_length = sizeof(client_addr);
+        client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_length);
         if (client_fd == -1) {
             perror("accept failed");
             continue;
         }
 
-        printf("Client connected.\n");
+        /* inet_ntoa() turns the client's IPv4 address into readable text. */
+        snprintf(client_ip, sizeof(client_ip), "%s", inet_ntoa(client_addr.sin_addr));
+        printf("[INFO] Client connected: %s\n", client_ip);
 
         handle_client(client_fd);
 
@@ -105,8 +122,7 @@ int create_server_socket(void)
 void handle_client(int client_fd)
 {
     char request_buffer[REQUEST_BUFFER_SIZE];
-    char method[METHOD_SIZE];
-    char path[PATH_SIZE];
+    HttpRequest request;
     char file_path[FILE_PATH_SIZE];
     char *query_string;
     ssize_t bytes_received;
@@ -122,46 +138,135 @@ void handle_client(int client_fd)
     /* Add a null terminator so sscanf() and printf() can treat it as text. */
     request_buffer[bytes_received] = '\0';
 
-    /* Pull the first two words from the request line.
-       Example request line: GET /index.html HTTP/1.1
-       After this, method is "GET" and path is "/index.html". */
-    if (sscanf(request_buffer, "%15s %255s", method, path) != 2) {
-        printf("Could not parse request line. Sending 404.\n");
-        send_404(client_fd);
+    /* A request struct keeps the parsed pieces together.
+       That makes later code easier to read than passing method, path, and version
+       around as separate local variables. */
+    if (!parse_http_request(request_buffer, &request)) {
+        printf("[ERROR] Failed to parse HTTP request\n");
+        send_400(client_fd);
         return;
     }
 
-    printf("Method: %s\n", method);
-    printf("Requested path: %s\n", path);
+    log_request(&request);
 
-    /* This tiny server only serves files for GET requests. */
-    if (strcmp(method, "GET") != 0) {
-        printf("Unsupported method: %s. Sending 404.\n\n", method);
-        send_404(client_fd);
+    /* This tiny server only serves files for GET requests.
+       405 means "the path may exist, but this HTTP method is not allowed here." */
+    if (strcmp(request.method, "GET") != 0) {
+        printf("[ERROR] Unsupported method: %s\n", request.method);
+        send_405(client_fd);
         return;
     }
 
     /* Ignore a query string so /style.css?v=1 still maps to /style.css. */
-    query_string = strchr(path, '?');
+    query_string = strchr(request.path, '?');
     if (query_string != NULL) {
         *query_string = '\0';
     }
 
-    /* Keep the file lookup inside ./public.
-       This is still an educational server, so the rule is intentionally simple. */
-    if (strstr(path, "..") != NULL) {
-        printf("Blocked suspicious path: %s. Sending 404.\n\n", path);
-        send_404(client_fd);
+    /* Path traversal is when a request tries to escape the web directory.
+       For example, /../../etc/passwd asks the server to walk upward in the
+       filesystem. This simple validation keeps requests inside ./public. */
+    if (!validate_path(request.path)) {
+        printf("[SECURITY] Path validation failed: %s\n", request.path);
+        send_403(client_fd);
         return;
     }
 
-    if (strcmp(path, "/") == 0) {
+    if (strcmp(request.path, "/") == 0) {
         snprintf(file_path, sizeof(file_path), "./public/index.html");
     } else {
-        snprintf(file_path, sizeof(file_path), "./public%s", path);
+        snprintf(file_path, sizeof(file_path), "./public%s", request.path);
     }
 
+    printf("[INFO] Filesystem path: %s\n", file_path);
     serve_file(client_fd, file_path);
+}
+
+int parse_http_request(const char *raw_request, HttpRequest *request)
+{
+    char request_line[REQUEST_BUFFER_SIZE];
+    char extra[16];
+    size_t line_length;
+
+    /* The first line of an HTTP request is:
+       METHOD path VERSION
+
+       Example:
+       GET /index.html HTTP/1.1
+
+       We copy only the first line before calling sscanf(). That matters because
+       a real HTTP request has more header lines after the request line.
+
+       sscanf() stops at whitespace, so it naturally reads those three words.
+       The width limits (%7s, %511s, %15s) protect our fixed-size arrays. */
+    memset(request, 0, sizeof(*request));
+    memset(request_line, 0, sizeof(request_line));
+
+    line_length = strcspn(raw_request, "\r\n");
+    if (line_length == 0 || line_length >= sizeof(request_line)) {
+        return 0;
+    }
+
+    memcpy(request_line, raw_request, line_length);
+
+    if (sscanf(request_line, "%7s %511s %15s %15s",
+               request->method, request->path, request->version, extra) != 3) {
+        return 0;
+    }
+
+    return 1;
+}
+
+int validate_path(const char *path)
+{
+    size_t i;
+    size_t path_length;
+
+    if (path == NULL) {
+        return 0;
+    }
+
+    path_length = strlen(path);
+
+    /* Empty, extremely long, or non-absolute paths are malformed for this server. */
+    if (path_length == 0 || path_length >= 512 || path[0] != '/') {
+        return 0;
+    }
+
+    /* ".." can mean "go up one directory", which can expose files outside ./public. */
+    if (strstr(path, "..") != NULL) {
+        return 0;
+    }
+
+    /* Repeated slashes are not needed for this small server and can hide odd paths. */
+    if (strstr(path, "//") != NULL) {
+        return 0;
+    }
+
+    /* Reject a few characters that make paths harder to reason about in a lesson. */
+    for (i = 0; i < path_length; i++) {
+        if (path[i] == '\\' || path[i] == ' ' || path[i] == '\t' ||
+            path[i] == '\r' || path[i] == '\n') {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+void log_request(const HttpRequest *request)
+{
+    /* Structured logs make it easier to follow one request through the server. */
+    printf("[REQUEST] %s %s %s\n", request->method, request->path, request->version);
+}
+
+void log_response(const char *status, const char *file_path)
+{
+    if (file_path != NULL) {
+        printf("[RESPONSE] %s %s\n\n", status, file_path);
+    } else {
+        printf("[RESPONSE] %s\n\n", status);
+    }
 }
 
 void send_response(int client_fd, const char *status_line, const char *content_type,
@@ -191,6 +296,40 @@ void send_response(int client_fd, const char *status_line, const char *content_t
     }
 }
 
+void send_400(int client_fd)
+{
+    const char *body = "<!doctype html>\n"
+                       "<html>\n"
+                       "<head><title>400 Bad Request</title></head>\n"
+                       "<body>\n"
+                       "<h1>400 Bad Request</h1>\n"
+                       "<p>The server could not understand the HTTP request line.</p>\n"
+                       "</body>\n"
+                       "</html>\n";
+
+    /* 400 is for malformed requests, such as a missing method/path/version. */
+    send_response(client_fd, "HTTP/1.1 400 Bad Request", "text/html",
+                  (long)strlen(body), (const unsigned char *)body);
+    log_response("400 Bad Request", NULL);
+}
+
+void send_403(int client_fd)
+{
+    const char *body = "<!doctype html>\n"
+                       "<html>\n"
+                       "<head><title>403 Forbidden</title></head>\n"
+                       "<body>\n"
+                       "<h1>403 Forbidden</h1>\n"
+                       "<p>The requested path is not allowed by this server.</p>\n"
+                       "</body>\n"
+                       "</html>\n";
+
+    /* 403 is for requests we understood but chose not to allow. */
+    send_response(client_fd, "HTTP/1.1 403 Forbidden", "text/html",
+                  (long)strlen(body), (const unsigned char *)body);
+    log_response("403 Forbidden", NULL);
+}
+
 void send_404(int client_fd)
 {
     const char *body = "<!doctype html>\n"
@@ -202,10 +341,26 @@ void send_404(int client_fd)
                        "</body>\n"
                        "</html>\n";
 
-    printf("404 Not Found\n\n");
-
+    /* 404 is for valid-looking paths that do not map to an existing file. */
     send_response(client_fd, "HTTP/1.1 404 Not Found", "text/html",
                   (long)strlen(body), (const unsigned char *)body);
+    log_response("404 Not Found", NULL);
+}
+
+void send_405(int client_fd)
+{
+    const char *body = "<!doctype html>\n"
+                       "<html>\n"
+                       "<head><title>405 Method Not Allowed</title></head>\n"
+                       "<body>\n"
+                       "<h1>405 Method Not Allowed</h1>\n"
+                       "<p>This educational server only supports GET requests.</p>\n"
+                       "</body>\n"
+                       "</html>\n";
+
+    send_response(client_fd, "HTTP/1.1 405 Method Not Allowed", "text/html",
+                  (long)strlen(body), (const unsigned char *)body);
+    log_response("405 Method Not Allowed", NULL);
 }
 
 const char *get_mime_type(const char *file_path)
@@ -251,7 +406,7 @@ void serve_file(int client_fd, const char *file_path)
 
     file = fopen(file_path, "rb");
     if (file == NULL) {
-        printf("File not found: %s\n", file_path);
+        printf("[INFO] File not found: %s\n", file_path);
         send_404(client_fd);
         return;
     }
@@ -294,9 +449,10 @@ void serve_file(int client_fd, const char *file_path)
 
     mime_type = get_mime_type(file_path);
 
-    printf("Serving file: %s (%ld bytes, %s)\n\n", file_path, file_size, mime_type);
+    printf("[INFO] Serving file: %s (%ld bytes, %s)\n", file_path, file_size, mime_type);
 
     send_response(client_fd, "HTTP/1.1 200 OK", mime_type, file_size, file_contents);
+    log_response("200 OK", file_path);
 
     free(file_contents);
 }
