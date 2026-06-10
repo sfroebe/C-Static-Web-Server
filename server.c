@@ -356,6 +356,18 @@ int validate_path(const char *path)
         return 0;
     }
 
+    /* Some clients or attackers may encode dots as %2e or %2E.
+       For example, /%2e%2e/server.c means the same thing as /../server.c
+       after URL decoding. This beginner server does not implement full URL
+       decoding yet, so we take the conservative educational approach and
+       reject encoded dots before they can become path traversal later. */
+    for (i = 0; i + 2 < path_length; i++) {
+        if (path[i] == '%' && path[i + 1] == '2' &&
+            (path[i + 2] == 'e' || path[i + 2] == 'E')) {
+            return 0;
+        }
+    }
+
     /* Repeated slashes are not needed for this small server and can hide odd paths. */
     if (strstr(path, "//") != NULL) {
         return 0;
