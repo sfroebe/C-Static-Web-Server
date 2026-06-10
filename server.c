@@ -1,11 +1,16 @@
-#include <stdio.h>      /* printf(), perror(), fopen(), fread(), fclose() */
+#include <stdio.h>      /* printf(), perror(), snprintf() */
 #include <stdlib.h>     /* EXIT_SUCCESS, EXIT_FAILURE, malloc(), free() */
 #include <string.h>     /* strlen(), strcmp(), strchr(), strrchr(), strstr(), memset(), memcpy() */
+#include <errno.h>      /* errno */
+#include <fcntl.h>      /* open(), O_RDONLY */
+#include <time.h>       /* time(), time_t */
 #include <unistd.h>     /* close() */
 #include <pthread.h>    /* pthread_create(), pthread_detach(), pthread_self() */
 #include <arpa/inet.h>  /* sockaddr_in, htons(), htonl() */
 #include <sys/types.h>  /* ssize_t */
 #include <sys/socket.h> /* socket(), bind(), listen(), accept(), recv(), send() */
+#include <sys/sendfile.h> /* sendfile() */
+#include <sys/stat.h>   /* fstat(), struct stat, S_ISREG() */
 
 #define PORT 8080
 #define BACKLOG 10
@@ -18,25 +23,50 @@ typedef struct {
     char version[16];
 } HttpRequest;
 
+typedef struct {
+    unsigned long total_requests;
+    unsigned long responses_200;
+    unsigned long responses_403;
+    unsigned long responses_404;
+    unsigned long responses_405;
+    unsigned long active_connections;
+    time_t start_time;
+} ServerStats;
+
+ServerStats server_stats;
+pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 int create_server_socket(void);
 void *client_thread(void *arg);
 void handle_client(int client_fd);
 int parse_http_request(const char *raw_request, HttpRequest *request);
 int validate_path(const char *path);
+void initialize_stats(void);
+void increment_request_count(void);
+void increment_response_count(int status_code);
+void increment_active_connections(void);
+void decrement_active_connections(void);
+ServerStats get_stats_snapshot(void);
 void log_request(const HttpRequest *request);
 void log_response(const char *status, const char *file_path);
+int send_header(int client_fd, const char *status_line, const char *content_type,
+                long content_length);
 void send_response(int client_fd, const char *status_line, const char *content_type,
                    long content_length, const unsigned char *body);
 void send_400(int client_fd);
+void send_500(int client_fd);
 void send_403(int client_fd);
 void send_404(int client_fd);
 void send_405(int client_fd);
+void serve_stats_page(int client_fd);
 const char *get_mime_type(const char *file_path);
-void serve_file(int client_fd, const char *file_path);
+void serve_file_sendfile(int client_fd, const char *file_path);
 
 int main(void)
 {
     int server_fd;
+
+    initialize_stats();
 
     server_fd = create_server_socket();
     if (server_fd == -1) {
@@ -181,6 +211,7 @@ void *client_thread(void *arg)
     client_fd = *(int *)arg;
     free(arg);
 
+    increment_active_connections();
     printf("[THREAD %lu] Handling client connection\n", (unsigned long)pthread_self());
 
     handle_client(client_fd);
@@ -190,6 +221,7 @@ void *client_thread(void *arg)
        once pthread_create() succeeds. */
     close(client_fd);
 
+    decrement_active_connections();
     printf("[THREAD %lu] Client connection closed\n", (unsigned long)pthread_self());
 
     return NULL;
@@ -213,6 +245,7 @@ void handle_client(int client_fd)
 
     /* Add a null terminator so sscanf() and printf() can treat it as text. */
     request_buffer[bytes_received] = '\0';
+    increment_request_count();
 
     /* A request struct keeps the parsed pieces together.
        That makes later code easier to read than passing method, path, and version
@@ -239,6 +272,15 @@ void handle_client(int client_fd)
         *query_string = '\0';
     }
 
+    /* /stats is a dynamic route, not a file in ./public.
+       We handle it before building a filesystem path so a request for /stats
+       becomes a live HTML report about this running process. */
+    if (strcmp(request.path, "/stats") == 0) {
+        printf("[STATS] Serving dynamic statistics page\n");
+        serve_stats_page(client_fd);
+        return;
+    }
+
     /* Path traversal is when a request tries to escape the web directory.
        For example, /../../etc/passwd asks the server to walk upward in the
        filesystem. This simple validation keeps requests inside ./public. */
@@ -255,7 +297,7 @@ void handle_client(int client_fd)
     }
 
     printf("[INFO] Filesystem path: %s\n", file_path);
-    serve_file(client_fd, file_path);
+    serve_file_sendfile(client_fd, file_path);
 }
 
 int parse_http_request(const char *raw_request, HttpRequest *request)
@@ -330,6 +372,79 @@ int validate_path(const char *path)
     return 1;
 }
 
+void initialize_stats(void)
+{
+    /* Server statistics are shared state: every worker thread can read or
+       update these counters at the same time.
+
+       A race condition happens when two threads touch the same data at once
+       and the final result depends on unlucky timing. For example, if two
+       threads both read total_requests as 10, both add 1, and both store 11,
+       the server lost one request count.
+
+       A mutex is a small lock. Only one thread may hold it at a time, so the
+       read-modify-write sequence for each counter stays correct and easy to
+       reason about. */
+    pthread_mutex_lock(&stats_mutex);
+    memset(&server_stats, 0, sizeof(server_stats));
+    server_stats.start_time = time(NULL);
+    pthread_mutex_unlock(&stats_mutex);
+}
+
+void increment_request_count(void)
+{
+    pthread_mutex_lock(&stats_mutex);
+    server_stats.total_requests++;
+    pthread_mutex_unlock(&stats_mutex);
+}
+
+void increment_response_count(int status_code)
+{
+    pthread_mutex_lock(&stats_mutex);
+
+    if (status_code == 200) {
+        server_stats.responses_200++;
+    } else if (status_code == 403) {
+        server_stats.responses_403++;
+    } else if (status_code == 404) {
+        server_stats.responses_404++;
+    } else if (status_code == 405) {
+        server_stats.responses_405++;
+    }
+
+    pthread_mutex_unlock(&stats_mutex);
+}
+
+void increment_active_connections(void)
+{
+    pthread_mutex_lock(&stats_mutex);
+    server_stats.active_connections++;
+    pthread_mutex_unlock(&stats_mutex);
+}
+
+void decrement_active_connections(void)
+{
+    pthread_mutex_lock(&stats_mutex);
+    if (server_stats.active_connections > 0) {
+        server_stats.active_connections--;
+    }
+    pthread_mutex_unlock(&stats_mutex);
+}
+
+ServerStats get_stats_snapshot(void)
+{
+    ServerStats snapshot;
+
+    /* Copy the whole struct while holding the mutex, then release the lock.
+       The /stats page can format HTML from this local snapshot without making
+       other request threads wait on slow string formatting or network I/O. */
+    pthread_mutex_lock(&stats_mutex);
+    snapshot = server_stats;
+    pthread_mutex_unlock(&stats_mutex);
+
+    return snapshot;
+}
+
 void log_request(const HttpRequest *request)
 {
     /* Structured logs make it easier to follow one request through the server. */
@@ -348,8 +463,8 @@ void log_response(const char *status, const char *file_path)
     }
 }
 
-void send_response(int client_fd, const char *status_line, const char *content_type,
-                   long content_length, const unsigned char *body)
+int send_header(int client_fd, const char *status_line, const char *content_type,
+                long content_length)
 {
     char header[512];
     int header_length;
@@ -365,6 +480,16 @@ void send_response(int client_fd, const char *status_line, const char *content_t
 
     if (send(client_fd, header, header_length, 0) == -1) {
         perror("send header failed");
+        return 0;
+    }
+
+    return 1;
+}
+
+void send_response(int client_fd, const char *status_line, const char *content_type,
+                   long content_length, const unsigned char *body)
+{
+    if (!send_header(client_fd, status_line, content_type, content_length)) {
         return;
     }
 
@@ -392,6 +517,22 @@ void send_400(int client_fd)
     log_response("400 Bad Request", NULL);
 }
 
+void send_500(int client_fd)
+{
+    const char *body = "<!doctype html>\n"
+                       "<html>\n"
+                       "<head><title>500 Internal Server Error</title></head>\n"
+                       "<body>\n"
+                       "<h1>500 Internal Server Error</h1>\n"
+                       "<p>The server had trouble sending the requested file.</p>\n"
+                       "</body>\n"
+                       "</html>\n";
+
+    send_response(client_fd, "HTTP/1.1 500 Internal Server Error", "text/html",
+                  (long)strlen(body), (const unsigned char *)body);
+    log_response("500 Internal Server Error", NULL);
+}
+
 void send_403(int client_fd)
 {
     const char *body = "<!doctype html>\n"
@@ -406,6 +547,7 @@ void send_403(int client_fd)
     /* 403 is for requests we understood but chose not to allow. */
     send_response(client_fd, "HTTP/1.1 403 Forbidden", "text/html",
                   (long)strlen(body), (const unsigned char *)body);
+    increment_response_count(403);
     log_response("403 Forbidden", NULL);
 }
 
@@ -423,6 +565,7 @@ void send_404(int client_fd)
     /* 404 is for valid-looking paths that do not map to an existing file. */
     send_response(client_fd, "HTTP/1.1 404 Not Found", "text/html",
                   (long)strlen(body), (const unsigned char *)body);
+    increment_response_count(404);
     log_response("404 Not Found", NULL);
 }
 
@@ -439,7 +582,58 @@ void send_405(int client_fd)
 
     send_response(client_fd, "HTTP/1.1 405 Method Not Allowed", "text/html",
                   (long)strlen(body), (const unsigned char *)body);
+    increment_response_count(405);
     log_response("405 Method Not Allowed", NULL);
+}
+
+void serve_stats_page(int client_fd)
+{
+    ServerStats snapshot;
+    char body[2048];
+    int body_length;
+    time_t now;
+    long uptime_seconds;
+
+    snapshot = get_stats_snapshot();
+    now = time(NULL);
+
+    /* Uptime is the current time minus the time recorded at server startup.
+       time_t stores calendar time in seconds on POSIX systems, which is good
+       enough for a simple educational status page. */
+    uptime_seconds = (long)(now - snapshot.start_time);
+
+    body_length = snprintf(body, sizeof(body),
+                           "<!doctype html>\n"
+                           "<html>\n"
+                           "<head><title>Server Stats</title></head>\n"
+                           "<body>\n"
+                           "<h1>Server Statistics</h1>\n"
+                           "<p>Total Requests: %lu</p>\n"
+                           "<p>Active Connections: %lu</p>\n"
+                           "<p>200 Responses: %lu</p>\n"
+                           "<p>404 Responses: %lu</p>\n"
+                           "<p>403 Responses: %lu</p>\n"
+                           "<p>405 Responses: %lu</p>\n"
+                           "<p>Uptime: %ld seconds</p>\n"
+                           "</body>\n"
+                           "</html>\n",
+                           snapshot.total_requests,
+                           snapshot.active_connections,
+                           snapshot.responses_200,
+                           snapshot.responses_404,
+                           snapshot.responses_403,
+                           snapshot.responses_405,
+                           uptime_seconds);
+
+    if (body_length < 0 || body_length >= (int)sizeof(body)) {
+        send_500(client_fd);
+        return;
+    }
+
+    send_response(client_fd, "HTTP/1.1 200 OK", "text/html",
+                  body_length, (const unsigned char *)body);
+    increment_response_count(200);
+    log_response("200 OK", "/stats");
 }
 
 const char *get_mime_type(const char *file_path)
@@ -475,63 +669,97 @@ const char *get_mime_type(const char *file_path)
     return "application/octet-stream";
 }
 
-void serve_file(int client_fd, const char *file_path)
+void serve_file_sendfile(int client_fd, const char *file_path)
 {
-    FILE *file;
-    long file_size;
-    unsigned char *file_contents;
-    size_t bytes_read;
+    int file_fd;
+    struct stat file_info;
+    off_t offset;
+    off_t remaining_bytes;
+    ssize_t bytes_sent;
     const char *mime_type;
 
-    file = fopen(file_path, "rb");
-    if (file == NULL) {
+    /* The older version of this server used:
+
+           fopen() -> malloc() -> fread() -> send() -> free()
+
+       That approach is easy to understand, but it copies the whole file from
+       the kernel into this program's user-space memory, then send() copies
+       those bytes back into the kernel so the network stack can transmit them.
+
+       Linux sendfile() is a more direct path. It asks the kernel to move bytes
+       from a file descriptor to a socket descriptor. At a high level, this is
+       called "zero-copy" because the file contents do not need to be copied
+       into our own malloc'd buffer first. That can reduce CPU work and memory
+       use, especially for large files or many simultaneous clients.
+
+       We still keep the code beginner-friendly: open the file, ask fstat()
+       for its size, send normal HTTP headers, then stream the body with
+       sendfile(). */
+    file_fd = open(file_path, O_RDONLY);
+    if (file_fd == -1) {
         printf("[INFO] File not found: %s\n", file_path);
         send_404(client_fd);
         return;
     }
 
-    /* Move to the end to learn the file size, then move back to the start. */
-    if (fseek(file, 0, SEEK_END) != 0) {
-        perror("fseek failed");
-        fclose(file);
-        send_404(client_fd);
+    /* fstat() reads metadata for the already-open file descriptor.
+       We need st_size for the HTTP Content-Length header. */
+    if (fstat(file_fd, &file_info) == -1) {
+        perror("fstat failed");
+        close(file_fd);
+        send_500(client_fd);
         return;
     }
 
-    file_size = ftell(file);
-    if (file_size < 0) {
-        perror("ftell failed");
-        fclose(file);
-        send_404(client_fd);
-        return;
-    }
-
-    rewind(file);
-
-    file_contents = malloc((size_t)file_size);
-    if (file_size > 0 && file_contents == NULL) {
-        perror("malloc failed");
-        fclose(file);
-        send_404(client_fd);
-        return;
-    }
-
-    bytes_read = fread(file_contents, 1, (size_t)file_size, file);
-    fclose(file);
-
-    if (bytes_read != (size_t)file_size) {
-        printf("Could not read entire file: %s\n", file_path);
-        free(file_contents);
+    /* This static server is meant to serve regular files, not directories,
+       devices, or other special filesystem objects. */
+    if (!S_ISREG(file_info.st_mode)) {
+        printf("[INFO] Not a regular file: %s\n", file_path);
+        close(file_fd);
         send_404(client_fd);
         return;
     }
 
     mime_type = get_mime_type(file_path);
 
-    printf("[INFO] Serving file: %s (%ld bytes, %s)\n", file_path, file_size, mime_type);
+    printf("[FILE] %s\n", file_path);
+    printf("[FILE] Size: %ld bytes\n", (long)file_info.st_size);
+    printf("[FILE] MIME: %s\n", mime_type);
 
-    send_response(client_fd, "HTTP/1.1 200 OK", mime_type, file_size, file_contents);
+    if (!send_header(client_fd, "HTTP/1.1 200 OK", mime_type, (long)file_info.st_size)) {
+        close(file_fd);
+        return;
+    }
+
+    offset = 0;
+    remaining_bytes = file_info.st_size;
+
+    while (remaining_bytes > 0) {
+        bytes_sent = sendfile(client_fd, file_fd, &offset, (size_t)remaining_bytes);
+
+        if (bytes_sent == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            /* If sendfile() fails after the 200 OK header has already been
+               sent, HTTP does not let us take that header back and replace it
+               with a clean error response. For this educational server we log
+               the failure clearly and close the connection. */
+            perror("sendfile failed");
+            close(file_fd);
+            return;
+        }
+
+        if (bytes_sent == 0) {
+            break;
+        }
+
+        remaining_bytes -= bytes_sent;
+    }
+
+    close(file_fd);
+
+    increment_response_count(200);
     log_response("200 OK", file_path);
-
-    free(file_contents);
 }
