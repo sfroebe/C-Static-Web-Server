@@ -26,6 +26,7 @@ typedef struct {
 typedef struct {
     unsigned long total_requests;
     unsigned long responses_200;
+    unsigned long responses_400;
     unsigned long responses_403;
     unsigned long responses_404;
     unsigned long responses_405;
@@ -416,6 +417,8 @@ void increment_response_count(int status_code)
 
     if (status_code == 200) {
         server_stats.responses_200++;
+    } else if (status_code == 400) {
+        server_stats.responses_400++;
     } else if (status_code == 403) {
         server_stats.responses_403++;
     } else if (status_code == 404) {
@@ -526,6 +529,7 @@ void send_400(int client_fd)
     /* 400 is for malformed requests, such as a missing method/path/version. */
     send_response(client_fd, "HTTP/1.1 400 Bad Request", "text/html",
                   (long)strlen(body), (const unsigned char *)body);
+    increment_response_count(400);
     log_response("400 Bad Request", NULL);
 }
 
@@ -623,6 +627,7 @@ void serve_stats_page(int client_fd)
                            "<p>Total Requests: %lu</p>\n"
                            "<p>Active Connections: %lu</p>\n"
                            "<p>200 Responses: %lu</p>\n"
+                           "<p>400 Responses: %lu</p>\n"
                            "<p>404 Responses: %lu</p>\n"
                            "<p>403 Responses: %lu</p>\n"
                            "<p>405 Responses: %lu</p>\n"
@@ -632,6 +637,7 @@ void serve_stats_page(int client_fd)
                            snapshot.total_requests,
                            snapshot.active_connections,
                            snapshot.responses_200,
+                           snapshot.responses_400,
                            snapshot.responses_404,
                            snapshot.responses_403,
                            snapshot.responses_405,
