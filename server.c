@@ -163,6 +163,7 @@ int main(void)
 int create_server_socket(void)
 {
     int server_fd;
+    int reuse_address;
     struct sockaddr_in server_addr;
 
     /* Create a TCP socket using IPv4.
@@ -170,6 +171,22 @@ int create_server_socket(void)
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == -1) {
         perror("socket failed");
+        return -1;
+    }
+
+    /* Allow the server to restart right away after a crash or Ctrl+C.
+       Without this, the operating system may keep port 8080 reserved for a
+       short TIME_WAIT period, which can make bind() fail with:
+
+           Address already in use
+
+       This does not steal the port from another still-running server; it only
+       lets this process reuse the port once the previous socket is gone. */
+    reuse_address = 1;
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR,
+                   &reuse_address, sizeof(reuse_address)) == -1) {
+        perror("setsockopt SO_REUSEADDR failed");
+        close(server_fd);
         return -1;
     }
 
