@@ -3,3 +3,5 @@
 
 # Protect the performance record text files
 *.txt text eol=lf
+
+*.c text eol=lf

@@ -1,41 +1,21 @@
 #include <stdio.h>      /* printf(), perror(), snprintf() */
-#include <stdlib.h>     /* EXIT_SUCCESS, EXIT_FAILURE */
+#include <stdlib.h>     /* EXIT_SUCCESS, EXIT_FAILURE, malloc(), free() */
 #include <string.h>     /* strlen(), strcmp(), strchr(), strrchr(), strstr(), memset(), memcpy() */
 #include <errno.h>      /* errno */
-#include <stdint.h>     /* uint32_t */
-#include <fcntl.h>      /* open(), O_RDONLY, fcntl() */
+#include <fcntl.h>      /* open(), O_RDONLY */
 #include <time.h>       /* time(), time_t */
 #include <unistd.h>     /* close() */
+#include <pthread.h>    /* pthread_create(), pthread_detach(), pthread_self() */
 #include <arpa/inet.h>  /* sockaddr_in, htons(), htonl() */
 #include <sys/types.h>  /* ssize_t */
 #include <sys/socket.h> /* socket(), bind(), listen(), accept(), recv(), send() */
 #include <sys/sendfile.h> /* sendfile() */
 #include <sys/stat.h>   /* fstat(), struct stat, S_ISREG() */
-#include <sys/epoll.h>  /* epoll_create1(), epoll_ctl(), epoll_wait() */
 
 #define PORT 8080
-/* BACKLOG is the kernel queue for TCP handshakes waiting for accept(). It is
-   not a limit on active clients. A value of 10 was smaller than the benchmark
-   concurrency of 50, so connection bursts waited or retried before epoll could
-   accept them. Keep this comfortably above expected concurrent connections. */
-#define BACKLOG 128
+#define BACKLOG 10
 #define REQUEST_BUFFER_SIZE 4096
 #define FILE_PATH_SIZE 1024
-#define MAX_EPOLL_EVENTS 256
-#define RESPONSE_BUFFER_SIZE 4096
-
-/* Set to 1 while learning or debugging. The benchmark script overrides this
-   to 0 so terminal output does not become the server's bottleneck. Keeping
-   the default at 1 preserves the educational trace during normal use. */
-#ifndef ENABLE_LOGGING
-#define ENABLE_LOGGING 1
-#endif
-
-#if ENABLE_LOGGING
-#define LOG(...) printf(__VA_ARGS__)
-#else
-#define LOG(...) ((void)0)
-#endif
 
 typedef struct {
     char method[8];
@@ -54,36 +34,12 @@ typedef struct {
     time_t start_time;
 } ServerStats;
 
-/* One small state object belongs to each connected client. epoll stores a
-   pointer to this object in event.data.ptr, so the event loop can resume a
-   partial read or write without blocking or searching for the socket. */
-typedef struct {
-    int fd;
-    char request_buffer[REQUEST_BUFFER_SIZE];
-    size_t request_length;
-    unsigned char response_buffer[RESPONSE_BUFFER_SIZE];
-    size_t response_length;
-    size_t response_sent;
-    int file_fd;
-    off_t file_offset;
-    off_t file_remaining;
-} ClientConnection;
-
 ServerStats server_stats;
+pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int create_server_socket(void);
-int set_nonblocking(int fd);
-int create_epoll(void);
-int add_epoll_listener(int epoll_fd, int server_fd);
-int add_epoll_fd(int epoll_fd, ClientConnection *client);
-int modify_epoll_fd(int epoll_fd, ClientConnection *client, uint32_t events);
-int remove_epoll_fd(int epoll_fd, int fd);
-void close_client_connection(int epoll_fd, ClientConnection *client);
-void accept_new_connections(int epoll_fd, int server_fd);
-void process_client_socket(int epoll_fd, ClientConnection *client);
-void event_loop(int epoll_fd, int server_fd);
-void handle_client(ClientConnection *client);
-int flush_client_response(ClientConnection *client);
+void *client_thread(void *arg);
+void handle_client(int client_fd);
 int parse_http_request(const char *raw_request, HttpRequest *request);
 int validate_path(const char *path);
 void initialize_stats(void);
@@ -94,23 +50,22 @@ void decrement_active_connections(void);
 ServerStats get_stats_snapshot(void);
 void log_request(const HttpRequest *request);
 void log_response(const char *status, const char *file_path);
-int send_header(ClientConnection *client, const char *status_line, const char *content_type,
+int send_header(int client_fd, const char *status_line, const char *content_type,
                 long content_length);
-void send_response(ClientConnection *client, const char *status_line, const char *content_type,
+void send_response(int client_fd, const char *status_line, const char *content_type,
                    long content_length, const unsigned char *body);
-void send_400(ClientConnection *client);
-void send_500(ClientConnection *client);
-void send_403(ClientConnection *client);
-void send_404(ClientConnection *client);
-void send_405(ClientConnection *client);
-void serve_stats_page(ClientConnection *client);
+void send_400(int client_fd);
+void send_500(int client_fd);
+void send_403(int client_fd);
+void send_404(int client_fd);
+void send_405(int client_fd);
+void serve_stats_page(int client_fd);
 const char *get_mime_type(const char *file_path);
-void serve_file_sendfile(ClientConnection *client, const char *file_path);
+void serve_file_sendfile(int client_fd, const char *file_path);
 
 int main(void)
 {
     int server_fd;
-    int epoll_fd;
 
     initialize_stats();
 
@@ -119,300 +74,90 @@ int main(void)
         return EXIT_FAILURE;
     }
 
-    /* epoll is Linux's readiness-notification interface. Instead of creating
-       one thread per client and letting each thread block in recv(), this one
-       thread asks the kernel which descriptors are ready right now.
-
-       epoll does not perform I/O for us. An event simply says that an operation
-       such as accept() or recv() is unlikely to block at this moment. */
-    epoll_fd = create_epoll();
-    if (epoll_fd == -1) {
-        close(server_fd);
-        return EXIT_FAILURE;
-    }
-
-    if (!set_nonblocking(server_fd)) {
-        close(epoll_fd);
-        close(server_fd);
-        return EXIT_FAILURE;
-    }
-
-    if (!add_epoll_listener(epoll_fd, server_fd)) {
-        close(epoll_fd);
-        close(server_fd);
-        return EXIT_FAILURE;
-    }
-
     printf("Server listening on http://localhost:%d\n", PORT);
     printf("Serving files from the ./public directory.\n");
     printf("Press Ctrl+C to stop the server.\n\n");
 
-    event_loop(epoll_fd, server_fd);
+    /* Keep accepting clients forever.
 
-    close(epoll_fd);
+       In the earlier single-threaded version, the server did this:
+
+           accept one client -> handle that client -> accept the next client
+
+       That is simple, but one slow client can make every other client wait.
+
+       In this threaded version, the main thread only accepts new connections.
+       Each client is handed to a worker thread, so several requests can be in
+       progress at the same time. This is called thread-per-connection
+       concurrency. It is easy to understand, but it is not infinitely scalable:
+       thousands of clients would mean thousands of operating-system threads. */
+    while (1) {
+        int client_fd;
+        int *client_fd_ptr;
+        struct sockaddr_in client_addr;
+        socklen_t client_addr_length;
+        char client_ip[INET_ADDRSTRLEN];
+        pthread_t thread_id;
+        int pthread_result;
+
+        /* accept() blocks here until a browser or curl opens a connection. */
+        client_addr_length = sizeof(client_addr);
+        client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_length);
+        if (client_fd == -1) {
+            perror("accept failed");
+            continue;
+        }
+
+        /* inet_ntoa() turns the client's IPv4 address into readable text. */
+        snprintf(client_ip, sizeof(client_ip), "%s", inet_ntoa(client_addr.sin_addr));
+        printf("[INFO] Client connected: %s\n", client_ip);
+
+        /* Give the client socket to a worker thread.
+
+           IMPORTANT: do not pass &client_fd directly to pthread_create().
+           client_fd is a stack variable that gets reused on the next loop
+           iteration. If the main thread accepts another client before the
+           worker thread copies the value, both threads could look at the same
+           changing variable. That race can make a worker handle the wrong
+           socket, or a socket that has already been replaced.
+
+           Allocating one int per connection gives each worker its own stable
+           copy. The worker frees this memory after copying out the fd value. */
+        client_fd_ptr = malloc(sizeof(*client_fd_ptr));
+        if (client_fd_ptr == NULL) {
+            perror("malloc failed");
+            close(client_fd);
+            continue;
+        }
+
+        *client_fd_ptr = client_fd;
+
+        /* pthread_create() starts client_thread() in a new thread.
+           The fourth argument is the one void* value passed to that function. */
+        pthread_result = pthread_create(&thread_id, NULL, client_thread, client_fd_ptr);
+        if (pthread_result != 0) {
+            printf("[ERROR] pthread_create failed: %s\n", strerror(pthread_result));
+            free(client_fd_ptr);
+            close(client_fd);
+            continue;
+        }
+
+        /* A detached thread cleans up its own thread resources when it exits.
+           That keeps this small server from needing to remember every thread
+           and call pthread_join() later. */
+        pthread_result = pthread_detach(thread_id);
+        if (pthread_result != 0) {
+            printf("[ERROR] pthread_detach failed: %s\n", strerror(pthread_result));
+        }
+
+        printf("[THREAD] Spawned worker thread %lu for %s\n",
+               (unsigned long)thread_id, client_ip);
+    }
+
+    /* This line is never reached in this simple server, but it shows proper cleanup. */
     close(server_fd);
 
     return EXIT_SUCCESS;
-}
-
-int set_nonblocking(int fd)
-{
-    int flags;
-
-    /* A blocking recv(), accept(), or sendfile() can pause the only event-loop
-       thread. While it waits for one slow client, no other ready client is
-       handled. O_NONBLOCK makes these calls return EAGAIN instead, so the loop
-       stays in control and can return to epoll_wait(). */
-    flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        perror("fcntl O_NONBLOCK failed");
-        return 0;
-    }
-
-    return 1;
-}
-
-int create_epoll(void)
-{
-    int epoll_fd = epoll_create1(0);
-
-    if (epoll_fd == -1) {
-        perror("epoll_create1 failed");
-    }
-
-    return epoll_fd;
-}
-
-int add_epoll_listener(int epoll_fd, int server_fd)
-{
-    struct epoll_event event;
-
-    memset(&event, 0, sizeof(event));
-    event.events = EPOLLIN;
-    /* NULL identifies the listening socket; client events hold a pointer. */
-    event.data.ptr = NULL;
-
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &event) == -1) {
-        perror("epoll_ctl ADD listener failed");
-        return 0;
-    }
-
-    return 1;
-}
-
-int add_epoll_fd(int epoll_fd, ClientConnection *client)
-{
-    struct epoll_event event;
-
-    memset(&event, 0, sizeof(event));
-    event.events = EPOLLIN;
-    event.data.ptr = client;
-
-    /* EPOLLIN asks for read readiness. We deliberately do not use EPOLLET:
-       level-triggered epoll keeps reporting a descriptor while it remains
-       readable, which is easier to reason about than edge-triggered mode. */
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client->fd, &event) == -1) {
-        perror("epoll_ctl ADD failed");
-        return 0;
-    }
-
-    return 1;
-}
-
-int modify_epoll_fd(int epoll_fd, ClientConnection *client, uint32_t events)
-{
-    struct epoll_event event;
-
-    memset(&event, 0, sizeof(event));
-    event.events = events;
-    event.data.ptr = client;
-
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, client->fd, &event) == -1) {
-        perror("epoll_ctl MOD failed");
-        return 0;
-    }
-
-    return 1;
-}
-
-int remove_epoll_fd(int epoll_fd, int fd)
-{
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL) == -1 && errno != ENOENT) {
-        perror("epoll_ctl DEL failed");
-        return 0;
-    }
-
-    return 1;
-}
-
-void accept_new_connections(int epoll_fd, int server_fd)
-{
-    while (1) {
-        int client_fd;
-        ClientConnection *client;
-        struct sockaddr_in client_addr;
-        socklen_t client_addr_length = sizeof(client_addr);
-        char client_ip[INET_ADDRSTRLEN];
-
-        client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_addr_length);
-        if (client_fd == -1) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                /* All currently pending connections were accepted. */
-                return;
-            }
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("accept failed");
-            return;
-        }
-
-        snprintf(client_ip, sizeof(client_ip), "%s", inet_ntoa(client_addr.sin_addr));
-        LOG("[EPOLL] Accepted client: %s\n", client_ip);
-
-        /* malloc avoids clearing two fixed-size buffers that recv()/snprintf()
-           immediately overwrite. Explicitly initialize only state fields. */
-        client = malloc(sizeof(*client));
-        if (client == NULL) {
-            perror("malloc client failed");
-            close(client_fd);
-            continue;
-        }
-
-        client->fd = client_fd;
-        client->request_length = 0;
-        client->response_length = 0;
-        client->response_sent = 0;
-        client->file_fd = -1;
-        client->file_offset = 0;
-        client->file_remaining = 0;
-
-        if (!set_nonblocking(client_fd) || !add_epoll_fd(epoll_fd, client)) {
-            close(client_fd);
-            free(client);
-            continue;
-        }
-
-        increment_active_connections();
-    }
-}
-
-void close_client_connection(int epoll_fd, ClientConnection *client)
-{
-    int client_fd = client->fd;
-
-    remove_epoll_fd(epoll_fd, client_fd);
-    close(client_fd);
-    if (client->file_fd != -1) {
-        close(client->file_fd);
-    }
-    free(client);
-    decrement_active_connections();
-    LOG("[EPOLL] Closing connection: fd=%d\n", client_fd);
-}
-
-void process_client_socket(int epoll_fd, ClientConnection *client)
-{
-    ssize_t bytes_received;
-
-    /* Read until the request headers arrive or the non-blocking socket says
-       EAGAIN. The buffer is retained in ClientConnection if TCP split the
-       request across packets. */
-    while (client->request_length < sizeof(client->request_buffer) - 1) {
-        bytes_received = recv(client->fd,
-                              client->request_buffer + client->request_length,
-                              sizeof(client->request_buffer) - 1 - client->request_length,
-                              0);
-        if (bytes_received > 0) {
-            client->request_length += (size_t)bytes_received;
-            client->request_buffer[client->request_length] = '\0';
-
-            if (strstr(client->request_buffer, "\r\n\r\n") != NULL ||
-                strstr(client->request_buffer, "\n\n") != NULL) {
-                LOG("[EPOLL] Client socket ready: fd=%d\n", client->fd);
-                handle_client(client);
-
-                if (flush_client_response(client) == 1) {
-                    close_client_connection(epoll_fd, client);
-                } else if (!modify_epoll_fd(epoll_fd, client, EPOLLOUT)) {
-                    close_client_connection(epoll_fd, client);
-                }
-                return;
-            }
-            continue;
-        }
-
-        if (bytes_received == 0) {
-            close_client_connection(epoll_fd, client);
-            return;
-        }
-
-        if (errno == EINTR) {
-            continue;
-        }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return;
-        }
-
-        perror("recv failed");
-        close_client_connection(epoll_fd, client);
-        return;
-    }
-
-    /* A full buffer without an end-of-headers marker is malformed. */
-    increment_request_count();
-    send_400(client);
-    if (flush_client_response(client) == 1) {
-        close_client_connection(epoll_fd, client);
-    } else if (!modify_epoll_fd(epoll_fd, client, EPOLLOUT)) {
-        close_client_connection(epoll_fd, client);
-    }
-}
-
-void event_loop(int epoll_fd, int server_fd)
-{
-    struct epoll_event events[MAX_EPOLL_EVENTS];
-
-    while (1) {
-        int ready_count;
-        int i;
-
-        /* epoll_wait() sleeps without consuming CPU until the kernel has one
-           or more events. It returns only ready descriptors, rather than
-           making us scan every connected socket ourselves. */
-        ready_count = epoll_wait(epoll_fd, events, MAX_EPOLL_EVENTS, -1);
-        if (ready_count == -1) {
-            if (errno == EINTR) {
-                continue;
-            }
-            perror("epoll_wait failed");
-            return;
-        }
-
-        for (i = 0; i < ready_count; i++) {
-            ClientConnection *client = events[i].data.ptr;
-
-            if (client == NULL) {
-                LOG("[EPOLL] Listening socket ready\n");
-                accept_new_connections(epoll_fd, server_fd);
-            } else if (events[i].events & EPOLLIN) {
-                /* Check readable data first. A client can send a request and
-                   close its write side in the same event, so EPOLLIN may be
-                   present together with a hangup flag. */
-                process_client_socket(epoll_fd, client);
-            } else if (events[i].events & EPOLLOUT) {
-                if (flush_client_response(client) == 1) {
-                    close_client_connection(epoll_fd, client);
-                } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                    close_client_connection(epoll_fd, client);
-                }
-            } else if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-                /* A peer that disconnected has no request left for us to read. */
-                LOG("[EPOLL] Client error or hangup: fd=%d\n", client->fd);
-                close_client_connection(epoll_fd, client);
-            }
-        }
-    }
 }
 
 int create_server_socket(void)
@@ -475,22 +220,57 @@ int create_server_socket(void)
     return server_fd;
 }
 
-void handle_client(ClientConnection *client)
+void *client_thread(void *arg)
 {
+    int client_fd;
+
+    /* The main accept loop allocated this int so the worker gets a stable
+       socket descriptor, not the address of a changing stack variable. */
+    client_fd = *(int *)arg;
+    free(arg);
+
+    increment_active_connections();
+    printf("[THREAD %lu] Handling client connection\n", (unsigned long)pthread_self());
+
+    handle_client(client_fd);
+
+    /* This server closes each connection after one request and response.
+       Closing here matters because the worker thread owns the client socket
+       once pthread_create() succeeds. */
+    close(client_fd);
+
+    decrement_active_connections();
+    printf("[THREAD %lu] Client connection closed\n", (unsigned long)pthread_self());
+
+    return NULL;
+}
+
+void handle_client(int client_fd)
+{
+    char request_buffer[REQUEST_BUFFER_SIZE];
     HttpRequest request;
     char file_path[FILE_PATH_SIZE];
     char *query_string;
+    ssize_t bytes_received;
 
-    /* process_client_socket() already collected a complete request header.
-       The buffer lives with the connection so a partial TCP read is preserved. */
+    /* Read the client's HTTP request into our buffer.
+       Leave one byte free so we can add a '\0' string terminator. */
+    bytes_received = recv(client_fd, request_buffer, sizeof(request_buffer) - 1, 0);
+    if (bytes_received == -1) {
+        perror("recv failed");
+        return;
+    }
+
+    /* Add a null terminator so sscanf() and printf() can treat it as text. */
+    request_buffer[bytes_received] = '\0';
     increment_request_count();
 
     /* A request struct keeps the parsed pieces together.
        That makes later code easier to read than passing method, path, and version
        around as separate local variables. */
-    if (!parse_http_request(client->request_buffer, &request)) {
+    if (!parse_http_request(request_buffer, &request)) {
         printf("[ERROR] Failed to parse HTTP request\n");
-        send_400(client);
+        send_400(client_fd);
         return;
     }
 
@@ -500,7 +280,7 @@ void handle_client(ClientConnection *client)
        405 means "the path may exist, but this HTTP method is not allowed here." */
     if (strcmp(request.method, "GET") != 0) {
         printf("[ERROR] Unsupported method: %s\n", request.method);
-        send_405(client);
+        send_405(client_fd);
         return;
     }
 
@@ -514,8 +294,8 @@ void handle_client(ClientConnection *client)
        We handle it before building a filesystem path so a request for /stats
        becomes a live HTML report about this running process. */
     if (strcmp(request.path, "/stats") == 0) {
-        LOG("[STATS] Serving dynamic statistics page\n");
-        serve_stats_page(client);
+        printf("[STATS] Serving dynamic statistics page\n");
+        serve_stats_page(client_fd);
         return;
     }
 
@@ -523,8 +303,8 @@ void handle_client(ClientConnection *client)
        For example, /../../etc/passwd asks the server to walk upward in the
        filesystem. This simple validation keeps requests inside ./public. */
     if (!validate_path(request.path)) {
-        LOG("[SECURITY] Path validation failed: %s\n", request.path);
-        send_403(client);
+        printf("[SECURITY] Path validation failed: %s\n", request.path);
+        send_403(client_fd);
         return;
     }
 
@@ -534,8 +314,8 @@ void handle_client(ClientConnection *client)
         snprintf(file_path, sizeof(file_path), "./public%s", request.path);
     }
 
-    LOG("[INFO] Filesystem path: %s\n", file_path);
-    serve_file_sendfile(client, file_path);
+    printf("[INFO] Filesystem path: %s\n", file_path);
+    serve_file_sendfile(client_fd, file_path);
 }
 
 int parse_http_request(const char *raw_request, HttpRequest *request)
@@ -624,21 +404,34 @@ int validate_path(const char *path)
 
 void initialize_stats(void)
 {
-    /* The old pthread server needed a mutex because many worker threads could
-       update these values simultaneously. The epoll event loop is one thread,
-       so each update finishes before the next event is processed. That removes
-       the race condition and makes mutexes unnecessary for this architecture. */
+    /* Server statistics are shared state: every worker thread can read or
+       update these counters at the same time.
+
+       A race condition happens when two threads touch the same data at once
+       and the final result depends on unlucky timing. For example, if two
+       threads both read total_requests as 10, both add 1, and both store 11,
+       the server lost one request count.
+
+       A mutex is a small lock. Only one thread may hold it at a time, so the
+       read-modify-write sequence for each counter stays correct and easy to
+       reason about. */
+    pthread_mutex_lock(&stats_mutex);
     memset(&server_stats, 0, sizeof(server_stats));
     server_stats.start_time = time(NULL);
+    pthread_mutex_unlock(&stats_mutex);
 }
 
 void increment_request_count(void)
 {
+    pthread_mutex_lock(&stats_mutex);
     server_stats.total_requests++;
+    pthread_mutex_unlock(&stats_mutex);
 }
 
 void increment_response_count(int status_code)
 {
+    pthread_mutex_lock(&stats_mutex);
+
     if (status_code == 200) {
         server_stats.responses_200++;
     } else if (status_code == 400) {
@@ -651,28 +444,35 @@ void increment_response_count(int status_code)
         server_stats.responses_405++;
     }
 
+    pthread_mutex_unlock(&stats_mutex);
 }
 
 void increment_active_connections(void)
 {
+    pthread_mutex_lock(&stats_mutex);
     server_stats.active_connections++;
+    pthread_mutex_unlock(&stats_mutex);
 }
 
 void decrement_active_connections(void)
 {
+    pthread_mutex_lock(&stats_mutex);
     if (server_stats.active_connections > 0) {
         server_stats.active_connections--;
     }
+    pthread_mutex_unlock(&stats_mutex);
 }
 
 ServerStats get_stats_snapshot(void)
 {
     ServerStats snapshot;
 
-    /* A local snapshot keeps the formatting code separate from the counters.
-       No lock is needed: the one event-loop thread cannot concurrently change
-       server_stats while it is already executing this function. */
+    /* Copy the whole struct while holding the mutex, then release the lock.
+       The /stats page can format HTML from this local snapshot without making
+       other request threads wait on slow string formatting or network I/O. */
+    pthread_mutex_lock(&stats_mutex);
     snapshot = server_stats;
+    pthread_mutex_unlock(&stats_mutex);
 
     return snapshot;
 }
@@ -680,29 +480,29 @@ ServerStats get_stats_snapshot(void)
 void log_request(const HttpRequest *request)
 {
     /* Structured logs make it easier to follow one request through the server. */
-    LOG("[REQUEST] %s %s %s\n", request->method, request->path, request->version);
+    printf("[REQUEST][thread %lu] %s %s %s\n",
+           (unsigned long)pthread_self(), request->method, request->path, request->version);
 }
 
 void log_response(const char *status, const char *file_path)
 {
     if (file_path != NULL) {
-        LOG("[RESPONSE] %s %s\n\n", status, file_path);
+        printf("[RESPONSE][thread %lu] %s %s\n\n",
+               (unsigned long)pthread_self(), status, file_path);
     } else {
-        LOG("[RESPONSE] %s\n\n", status);
+        printf("[RESPONSE][thread %lu] %s\n\n",
+               (unsigned long)pthread_self(), status);
     }
 }
 
-int send_header(ClientConnection *client, const char *status_line, const char *content_type,
+int send_header(int client_fd, const char *status_line, const char *content_type,
                 long content_length)
 {
+    char header[512];
     int header_length;
 
-    /* Queue headers rather than sending them immediately. If the socket's
-       output buffer fills, EPOLLOUT will resume this exact byte position. */
-    client->response_sent = 0;
-    client->response_length = 0;
-    header_length = snprintf((char *)client->response_buffer,
-                             sizeof(client->response_buffer),
+    /* HTTP responses start with headers, then a blank line, then the body bytes. */
+    header_length = snprintf(header, sizeof(header),
                              "%s\r\n"
                              "Content-Type: %s\r\n"
                              "Content-Length: %ld\r\n"
@@ -710,85 +510,29 @@ int send_header(ClientConnection *client, const char *status_line, const char *c
                              "\r\n",
                              status_line, content_type, content_length);
 
-    if (header_length < 0 || header_length >= (int)sizeof(client->response_buffer)) {
-        perror("response header too large");
+    if (send(client_fd, header, header_length, 0) == -1) {
+        perror("send header failed");
         return 0;
     }
 
-    client->response_length = (size_t)header_length;
     return 1;
 }
 
-void send_response(ClientConnection *client, const char *status_line, const char *content_type,
+void send_response(int client_fd, const char *status_line, const char *content_type,
                    long content_length, const unsigned char *body)
 {
-    if (!send_header(client, status_line, content_type, content_length)) {
+    if (!send_header(client_fd, status_line, content_type, content_length)) {
         return;
     }
 
-    if (content_length > 0 && body != NULL &&
-        client->response_length + (size_t)content_length <= sizeof(client->response_buffer)) {
-        memcpy(client->response_buffer + client->response_length, body, (size_t)content_length);
-        client->response_length += (size_t)content_length;
-    } else if (content_length > 0) {
-        /* All built-in error and stats pages fit in RESPONSE_BUFFER_SIZE. */
-        perror("response body too large");
+    if (content_length > 0 && body != NULL) {
+        if (send(client_fd, body, (size_t)content_length, 0) == -1) {
+            perror("send body failed");
+        }
     }
 }
 
-/* Return 1 when every queued byte has been sent, 0 when epoll must wait for
-   EPOLLOUT, or -1 on a real socket/file error. This is the key difference from
-   the earlier synchronous response path: a slow receiver no longer blocks the
-   whole server and no response bytes are discarded on EAGAIN. */
-int flush_client_response(ClientConnection *client)
-{
-    ssize_t bytes_sent;
-
-    while (client->response_sent < client->response_length) {
-        bytes_sent = send(client->fd,
-                          client->response_buffer + client->response_sent,
-                          client->response_length - client->response_sent,
-                          MSG_NOSIGNAL);
-        if (bytes_sent > 0) {
-            client->response_sent += (size_t)bytes_sent;
-            continue;
-        }
-        if (bytes_sent == -1 && errno == EINTR) {
-            continue;
-        }
-        if (bytes_sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return 0;
-        }
-        perror("send response failed");
-        return -1;
-    }
-
-    while (client->file_remaining > 0) {
-        bytes_sent = sendfile(client->fd, client->file_fd, &client->file_offset,
-                              (size_t)client->file_remaining);
-        if (bytes_sent > 0) {
-            client->file_remaining -= bytes_sent;
-            continue;
-        }
-        if (bytes_sent == -1 && errno == EINTR) {
-            continue;
-        }
-        if (bytes_sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return 0;
-        }
-        perror("sendfile failed");
-        return -1;
-    }
-
-    if (client->file_fd != -1) {
-        close(client->file_fd);
-        client->file_fd = -1;
-    }
-
-    return 1;
-}
-
-void send_400(ClientConnection *client)
+void send_400(int client_fd)
 {
     const char *body = "<!doctype html>\n"
                        "<html>\n"
@@ -800,13 +544,13 @@ void send_400(ClientConnection *client)
                        "</html>\n";
 
     /* 400 is for malformed requests, such as a missing method/path/version. */
-    send_response(client, "HTTP/1.1 400 Bad Request", "text/html",
+    send_response(client_fd, "HTTP/1.1 400 Bad Request", "text/html",
                   (long)strlen(body), (const unsigned char *)body);
     increment_response_count(400);
     log_response("400 Bad Request", NULL);
 }
 
-void send_500(ClientConnection *client)
+void send_500(int client_fd)
 {
     const char *body = "<!doctype html>\n"
                        "<html>\n"
@@ -817,12 +561,12 @@ void send_500(ClientConnection *client)
                        "</body>\n"
                        "</html>\n";
 
-    send_response(client, "HTTP/1.1 500 Internal Server Error", "text/html",
+    send_response(client_fd, "HTTP/1.1 500 Internal Server Error", "text/html",
                   (long)strlen(body), (const unsigned char *)body);
     log_response("500 Internal Server Error", NULL);
 }
 
-void send_403(ClientConnection *client)
+void send_403(int client_fd)
 {
     const char *body = "<!doctype html>\n"
                        "<html>\n"
@@ -834,13 +578,13 @@ void send_403(ClientConnection *client)
                        "</html>\n";
 
     /* 403 is for requests we understood but chose not to allow. */
-    send_response(client, "HTTP/1.1 403 Forbidden", "text/html",
+    send_response(client_fd, "HTTP/1.1 403 Forbidden", "text/html",
                   (long)strlen(body), (const unsigned char *)body);
     increment_response_count(403);
     log_response("403 Forbidden", NULL);
 }
 
-void send_404(ClientConnection *client)
+void send_404(int client_fd)
 {
     const char *body = "<!doctype html>\n"
                        "<html>\n"
@@ -852,13 +596,13 @@ void send_404(ClientConnection *client)
                        "</html>\n";
 
     /* 404 is for valid-looking paths that do not map to an existing file. */
-    send_response(client, "HTTP/1.1 404 Not Found", "text/html",
+    send_response(client_fd, "HTTP/1.1 404 Not Found", "text/html",
                   (long)strlen(body), (const unsigned char *)body);
     increment_response_count(404);
     log_response("404 Not Found", NULL);
 }
 
-void send_405(ClientConnection *client)
+void send_405(int client_fd)
 {
     const char *body = "<!doctype html>\n"
                        "<html>\n"
@@ -869,13 +613,13 @@ void send_405(ClientConnection *client)
                        "</body>\n"
                        "</html>\n";
 
-    send_response(client, "HTTP/1.1 405 Method Not Allowed", "text/html",
+    send_response(client_fd, "HTTP/1.1 405 Method Not Allowed", "text/html",
                   (long)strlen(body), (const unsigned char *)body);
     increment_response_count(405);
     log_response("405 Method Not Allowed", NULL);
 }
 
-void serve_stats_page(ClientConnection *client)
+void serve_stats_page(int client_fd)
 {
     ServerStats snapshot;
     char body[2048];
@@ -917,11 +661,11 @@ void serve_stats_page(ClientConnection *client)
                            uptime_seconds);
 
     if (body_length < 0 || body_length >= (int)sizeof(body)) {
-        send_500(client);
+        send_500(client_fd);
         return;
     }
 
-    send_response(client, "HTTP/1.1 200 OK", "text/html",
+    send_response(client_fd, "HTTP/1.1 200 OK", "text/html",
                   body_length, (const unsigned char *)body);
     increment_response_count(200);
     log_response("200 OK", "/stats");
@@ -960,10 +704,13 @@ const char *get_mime_type(const char *file_path)
     return "application/octet-stream";
 }
 
-void serve_file_sendfile(ClientConnection *client, const char *file_path)
+void serve_file_sendfile(int client_fd, const char *file_path)
 {
     int file_fd;
     struct stat file_info;
+    off_t offset;
+    off_t remaining_bytes;
+    ssize_t bytes_sent;
     const char *mime_type;
 
     /* The older version of this server used:
@@ -985,8 +732,8 @@ void serve_file_sendfile(ClientConnection *client, const char *file_path)
        sendfile(). */
     file_fd = open(file_path, O_RDONLY);
     if (file_fd == -1) {
-        LOG("[INFO] File not found: %s\n", file_path);
-        send_404(client);
+        printf("[INFO] File not found: %s\n", file_path);
+        send_404(client_fd);
         return;
     }
 
@@ -995,36 +742,58 @@ void serve_file_sendfile(ClientConnection *client, const char *file_path)
     if (fstat(file_fd, &file_info) == -1) {
         perror("fstat failed");
         close(file_fd);
-        send_500(client);
+        send_500(client_fd);
         return;
     }
 
     /* This static server is meant to serve regular files, not directories,
        devices, or other special filesystem objects. */
     if (!S_ISREG(file_info.st_mode)) {
-        LOG("[INFO] Not a regular file: %s\n", file_path);
+        printf("[INFO] Not a regular file: %s\n", file_path);
         close(file_fd);
-        send_404(client);
+        send_404(client_fd);
         return;
     }
 
     mime_type = get_mime_type(file_path);
 
-    LOG("[FILE] %s\n", file_path);
-    LOG("[FILE] Size: %ld bytes\n", (long)file_info.st_size);
-    LOG("[FILE] MIME: %s\n", mime_type);
+    printf("[FILE] %s\n", file_path);
+    printf("[FILE] Size: %ld bytes\n", (long)file_info.st_size);
+    printf("[FILE] MIME: %s\n", mime_type);
 
-    if (!send_header(client, "HTTP/1.1 200 OK", mime_type, (long)file_info.st_size)) {
+    if (!send_header(client_fd, "HTTP/1.1 200 OK", mime_type, (long)file_info.st_size)) {
         close(file_fd);
         return;
     }
 
-    /* Do not loop on sendfile() here. On a non-blocking socket it may return
-       EAGAIN, and spinning would stall every other client. flush_client_response()
-       keeps this state and resumes after epoll reports EPOLLOUT. */
-    client->file_fd = file_fd;
-    client->file_offset = 0;
-    client->file_remaining = file_info.st_size;
+    offset = 0;
+    remaining_bytes = file_info.st_size;
+
+    while (remaining_bytes > 0) {
+        bytes_sent = sendfile(client_fd, file_fd, &offset, (size_t)remaining_bytes);
+
+        if (bytes_sent == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            /* If sendfile() fails after the 200 OK header has already been
+               sent, HTTP does not let us take that header back and replace it
+               with a clean error response. For this educational server we log
+               the failure clearly and close the connection. */
+            perror("sendfile failed");
+            close(file_fd);
+            return;
+        }
+
+        if (bytes_sent == 0) {
+            break;
+        }
+
+        remaining_bytes -= bytes_sent;
+    }
+
+    close(file_fd);
 
     increment_response_count(200);
     log_response("200 OK", file_path);
