@@ -3,17 +3,17 @@ Benchmark Summary
 ========================================
 
 Results from: benchmark/results/apache.txt
-Requests per second:    4282.99 [#/sec] (mean)
-Time per request:       23.348 [ms] (mean)
+Requests per second:    4377.40 [#/sec] (mean)
+Time per request:       2.284 [ms] (mean)
 Failed requests:        0
 
 Results from: benchmark/results/custom.txt
-Requests per second:    344.20 [#/sec] (mean)
-Time per request:       290.530 [ms] (mean)
+Requests per second:    2256.63 [#/sec] (mean)
+Time per request:       4.431 [ms] (mean)
 Failed requests:        0
 
 Results from: benchmark/results/nginx.txt
-Requests per second:    6784.28 [#/sec] (mean)
-Time per request:       14.740 [ms] (mean)
+Requests per second:    6852.13 [#/sec] (mean)
+Time per request:       1.459 [ms] (mean)
 Failed requests:        0
 
