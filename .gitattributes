@@ -1,0 +1,7 @@
+# Protect the benchmark script
+*.sh text eol=lf
+
+# Protect the performance record text files
+*.txt text eol=lf
+
+*.c text eol=lf

@@ -37,6 +37,11 @@ echo "========================================"
 echo "Benchmarking Custom C Server"
 echo "========================================"
 
+# Build specifically for the benchmark. ENABLE_LOGGING=0 compiles LOG(...) to
+# nothing, so console output does not distort ApacheBench measurements.
+make clean
+make CFLAGS="-Wall -Wextra -pedantic -std=c11 -O2 -DENABLE_LOGGING=0"
+
 ./server &
 SERVER_PID=$!
 
@@ -87,20 +92,29 @@ ab -n $REQUESTS -c $CONCURRENCY http://127.0.0.1/ \
 # Summary
 ############################################################
 
-echo
-echo "========================================"
-echo "Benchmark Summary"
-echo "========================================"
+SUMMARY_FILE="$RESULTS_DIR/summary.txt"
+
+echo "========================================" | tee "$SUMMARY_FILE"
+echo "Benchmark Summary" | tee -a "$SUMMARY_FILE"
+echo "========================================" | tee -a "$SUMMARY_FILE"
 
 for file in "$RESULTS_DIR"/*.txt
 do
-    echo
-    echo "Results from: $file"
+    # Skip the summary file itself
+    if [[ "$file" == "$SUMMARY_FILE" ]]; then
+        continue
+    fi
 
-    grep "Requests per second" "$file"
-    grep "Time per request" "$file" | head -1
-    grep "Failed requests" "$file"
+    echo "" | tee -a "$SUMMARY_FILE"
+    echo "Results from: $file" | tee -a "$SUMMARY_FILE"
+
+    grep "Requests per second" "$file" | tee -a "$SUMMARY_FILE"
+    grep "Time per request" "$file" | head -1 | tee -a "$SUMMARY_FILE"
+    grep "Failed requests" "$file" | tee -a "$SUMMARY_FILE"
 done
+
+echo "" | tee -a "$SUMMARY_FILE"
+echo "Summary written to $SUMMARY_FILE"
 
 echo
 echo "========================================"
