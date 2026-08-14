@@ -37,6 +37,11 @@ echo "========================================"
 echo "Benchmarking Custom C Server"
 echo "========================================"
 
+# Build specifically for the benchmark. ENABLE_LOGGING=0 compiles LOG(...) to
+# nothing, so console output does not distort ApacheBench measurements.
+make clean
+make CFLAGS="-Wall -Wextra -pedantic -std=c11 -O2 -DENABLE_LOGGING=0"
+
 ./server &
 SERVER_PID=$!
 
